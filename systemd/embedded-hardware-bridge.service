@@ -1,0 +1,23 @@
+[Unit]
+Description=Embedded Hardware Bridge - Telemetry Daemon & Prometheus Exporter
+Documentation=https://github.com/patrick-isles/embedded-hardware-bridge
+After=network.target
+
+[Service]
+Type=simple
+User=pat
+WorkingDirectory=/home/pat/projects/embedded-hardware-bridge
+ExecStart=/home/pat/projects/embedded-hardware-bridge/bin/ehb-daemon --device /tmp/ehb-virtual-uart --port 9105
+Restart=always
+RestartSec=3s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ehb-daemon
+
+# Hardening / Sandboxing
+ProtectSystem=full
+ProtectHome=read-only
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

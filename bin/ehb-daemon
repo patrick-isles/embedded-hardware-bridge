@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+# ==============================================================================
+# Tool: ehb-daemon
+# Purpose: Linux Embedded Hardware Telemetry Daemon & Prometheus Exporter
+# Hardware Target: Serial/UART Telemetry (Physical TTY / Virtual HIL Loopback)
+# Author: Patrick Isles (https://github.com/patrick-isles)
+# License: MIT
+# ==============================================================================
+
+import os, sys, time, struct, threading, argparse, termios, tty
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+# Standard CRC-16-CCITT (Polynomial 0x1021, Init 0xFFFF)
+def crc16_ccitt(data: bytes, poly=0x1021, init=0xFFFF) -> int:
+    crc = init
+    for b in data:
+        crc ^= (b << 8)
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = ((crc << 1) ^ poly) & 0xFFFF
+            else:
+                crc = (crc << 1) & 0xFFFF
+    return crc
+
+SYNC_HEADER = bytes([0xAA, 0x55])
+PAYLOAD_FORMAT = ">HHHhBBI"
+PAYLOAD_LEN = struct.calcsize(PAYLOAD_FORMAT) # 14 bytes
+FULL_PACKET_LEN = 2 + 1 + PAYLOAD_LEN + 2     # 19 bytes
+
+class TelemetryState:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.voltage_v = 0.0
+        self.current_a = 0.0
+        self.power_w = 0.0
+        self.resistance_ohms = 0.0
+        self.raw_adc = 0
+        self.temp_c = 0.0
+        self.gpio_byte = 0
+        self.fault_byte = 0
+        self.seq_id = 0
+        self.packets_total = 0
+        self.crc_errors_total = 0
+        self.last_update = 0.0
+
+    def update(self, v_mv, i_ma, adc, temp_cdeg, gpio, faults, seq):
+        with self.lock:
+            self.voltage_v = v_mv / 1000.0
+            self.current_a = i_ma / 1000.0
+            self.power_w = self.voltage_v * self.current_a
+            self.resistance_ohms = (self.voltage_v / self.current_a) if self.current_a > 0.001 else 0.0
+            self.raw_adc = adc
+            self.temp_c = temp_cdeg / 100.0
+            self.gpio_byte = gpio
+            self.fault_byte = faults
+            self.seq_id = seq
+            self.packets_total += 1
+            self.last_update = time.time()
+
+    def record_crc_error(self):
+        with self.lock:
+            self.crc_errors_total += 1
+
+    def to_prometheus(self) -> str:
+        with self.lock:
+            now = time.time()
+            is_stale = 1 if (now - self.last_update > 2.0) else 0
+
+            lines = [
+                "# HELP eet_voltage_volts Measured DC bus voltage in Volts",
+                "# TYPE eet_voltage_volts gauge",
+                f"eet_voltage_volts {self.voltage_v:.4f}",
+                "",
+                "# HELP eet_current_amperes Measured DC bus current in Amperes",
+                "# TYPE eet_current_amperes gauge",
+                f"eet_current_amperes {self.current_a:.4f}",
+                "",
+                "# HELP eet_power_watts Calculated electrical power dissipation in Watts (P = V * I)",
+                "# TYPE eet_power_watts gauge",
+                f"eet_power_watts {self.power_w:.4f}",
+                "",
+                "# HELP eet_load_resistance_ohms Dynamic load resistance in Ohms (R = V / I)",
+                "# TYPE eet_load_resistance_ohms gauge",
+                f"eet_load_resistance_ohms {self.resistance_ohms:.3f}",
+                "",
+                "# HELP eet_temperature_celsius Measured thermal sensor temperature in Celsius",
+                "# TYPE eet_temperature_celsius gauge",
+                f"eet_temperature_celsius {self.temp_c:.2f}",
+                "",
+                "# HELP eet_adc_raw_value Raw 12-bit ADC integer register reading",
+                "# TYPE eet_adc_raw_value gauge",
+                f"eet_adc_raw_value {self.raw_adc}",
+                "",
+                "# HELP eet_gpio_pin_state Digital logic state of GPIO pins (1=HIGH, 0=LOW)",
+                "# TYPE eet_gpio_pin_state gauge",
+            ]
+
+            for pin in range(8):
+                state = 1 if (self.gpio_byte & (1 << pin)) else 0
+                lines.append(f'eet_gpio_pin_state{{pin="{pin}"}} {state}')
+
+            lines.extend([
+                "",
+                "# HELP eet_packets_total Monotonic counter of valid telemetry packets received",
+                "# TYPE eet_packets_total counter",
+                f"eet_packets_total {self.packets_total}",
+                "",
+                "# HELP eet_crc_errors_total Count of corrupted serial frames dropped by CRC-16 check",
+                "# TYPE eet_crc_errors_total counter",
+                f"eet_crc_errors_total {self.crc_errors_total}",
+                "",
+                "# HELP eet_fault_active Hardware fault alarm bitmask",
+                "# TYPE eet_fault_active gauge",
+                f'eet_fault_active{{fault="overvoltage"}} {1 if (self.fault_byte & 0x01) else 0}',
+                f'eet_fault_active{{fault="brownout"}} {1 if (self.fault_byte & 0x02) else 0}',
+                f'eet_fault_active{{fault="overtemp"}} {1 if (self.fault_byte & 0x04) else 0}',
+                "",
+                "# HELP eet_telemetry_stale 1 if serial stream interrupted for >2s, 0 otherwise",
+                "# TYPE eet_telemetry_stale gauge",
+                f"eet_telemetry_stale {is_stale}",
+                ""
+            ])
+            return "\n".join(lines)
+
+state = TelemetryState()
+
+class PrometheusHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/metrics":
+            content = state.to_prometheus().encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+            self.send_header("Content-Length", str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
+        elif self.path in ("/", "/status", "/api/telemetry"):
+            with state.lock:
+                json_str = (
+                    f'{{"voltage_v": {state.voltage_v:.3f}, '
+                    f'"current_a": {state.current_a:.3f}, '
+                    f'"power_w": {state.power_w:.3f}, '
+                    f'"resistance_ohms": {state.resistance_ohms:.2f}, '
+                    f'"raw_adc": {state.raw_adc}, '
+                    f'"temperature_c": {state.temp_c:.1f}, '
+                    f'"gpio_byte": {state.gpio_byte}, '
+                    f'"fault_byte": {state.fault_byte}, '
+                    f'"seq_id": {state.seq_id}, '
+                    f'"packets_total": {state.packets_total}, '
+                    f'"crc_errors": {state.crc_errors_total}, '
+                    f'"last_update": {state.last_update:.2f}}}'
+                )
+            content = json_str.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        # Suppress standard HTTP access logging to keep console clean
+        return
+
+def run_serial_listener(device_path, verbose=False):
+    print(f"\033[1m\033[36m[ehb-daemon]\033[0m Monitoring hardware bus on: \033[1m{device_path}\033[0m")
+    
+    while True:
+        try:
+            if not os.path.exists(device_path):
+                time.sleep(1.0)
+                continue
+
+            fd = os.open(device_path, os.O_RDONLY | os.O_NOCTTY)
+            try:
+                tty.setraw(fd)
+            except (termios.error, OSError):
+                pass
+            print(f"  \033[32m✓ Hardware connection established to {device_path}\033[0m")
+
+            buf = bytearray()
+            while True:
+                chunk = os.read(fd, 64)
+                if not chunk:
+                    time.sleep(0.01)
+                    continue
+                buf.extend(chunk)
+
+                # Hunt for 0xAA 0x55 frame synchronization
+                while len(buf) >= FULL_PACKET_LEN:
+                    sync_idx = buf.find(SYNC_HEADER)
+                    if sync_idx == -1:
+                        # No header found, clear buffer except last byte
+                        buf = buf[-1:]
+                        break
+                    if sync_idx > 0:
+                        # Discard garbage bytes preceding sync
+                        del buf[:sync_idx]
+
+                    if len(buf) < FULL_PACKET_LEN:
+                        break
+
+                    # Check payload length
+                    payload_len = buf[2]
+                    if payload_len != PAYLOAD_LEN:
+                        # Malformed length indicator, skip sync header and re-hunt
+                        del buf[0:2]
+                        state.record_crc_error()
+                        continue
+
+                    payload = bytes(buf[3:3 + PAYLOAD_LEN])
+                    rx_crc = struct.unpack(">H", buf[3 + PAYLOAD_LEN:3 + PAYLOAD_LEN + 2])[0]
+                    calc_crc = crc16_ccitt(payload)
+
+                    if rx_crc == calc_crc:
+                        v_mv, i_ma, adc, temp_cdeg, gpio, faults, seq = struct.unpack(PAYLOAD_FORMAT, payload)
+                        state.update(v_mv, i_ma, adc, temp_cdeg, gpio, faults, seq)
+                        if verbose:
+                            print(f"[RX #{seq:06d}] {v_mv/1000.0:.3f}V | {i_ma/1000.0:.3f}A | {temp_cdeg/100.0:.1f}°C | GPIO: 0b{gpio:08b} | CRC: OK")
+                        del buf[:FULL_PACKET_LEN]
+                    else:
+                        state.record_crc_error()
+                        if verbose:
+                            print(f"\033[31m[CRC ERROR]\033[0m Expected 0x{calc_crc:04X}, received 0x{rx_crc:04X} — Dropping frame.")
+                        del buf[0:2]
+
+        except (OSError, IOError) as e:
+            print(f"  \033[33m! Serial connection lost ({e}). Retrying in 1s...\033[0m")
+            time.sleep(1.0)
+
+def main():
+    parser = argparse.ArgumentParser(description="Linux Embedded Hardware Telemetry Daemon & Prometheus Exporter")
+    parser.add_argument("-d", "--device", default="/tmp/ehb-virtual-uart", help="Serial device path (/dev/ttyUSB0 or virtual UART)")
+    parser.add_argument("-p", "--port", type=int, default=9105, help="Prometheus HTTP exporter port (default: 9105)")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Print live decoded frames to stdout")
+    args = parser.parse_args()
+
+    # Start serial parser in background thread
+    t = threading.Thread(target=run_serial_listener, args=(args.device, args.verbose), daemon=True)
+    t.start()
+
+    # Start Prometheus HTTP server
+    server = HTTPServer(("0.0.0.0", args.port), PrometheusHandler)
+    print(f"\033[1m\033[36m[ehb-daemon]\033[0m Prometheus metrics exporter online: \033[1mhttp://localhost:{args.port}/metrics\033[0m")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n[ehb-daemon] Shutting down daemon...")
+
+if __name__ == "__main__":
+    main()

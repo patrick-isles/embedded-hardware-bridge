@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+# ==============================================================================
+# Tool: ehb-monitor
+# Purpose: Terminal Oscilloscope & Electrical Telemetry Monitor
+# Target: ehb-daemon Prometheus/JSON stream OR direct serial UART
+# Author: Patrick Isles (https://github.com/patrick-isles)
+# License: MIT
+# ==============================================================================
+
+import os, sys, time, struct, argparse, json
+from urllib.request import urlopen, Request
+from urllib.error import URLError
+
+# ANSI styling
+C_RESET   = "\033[0m"
+C_BOLD    = "\033[1m"
+C_DIM     = "\033[2m"
+C_RED     = "\033[31m"
+C_GREEN   = "\033[32m"
+C_YELLOW  = "\033[33m"
+C_BLUE    = "\033[34m"
+C_MAGENTA = "\033[35m"
+C_CYAN    = "\033[36m"
+C_WHITE   = "\033[37m"
+C_BG_RED  = "\033[41m"
+C_BG_GREEN= "\033[42m"
+C_CLEAR   = "\033[2J\033[H"
+C_HIDE_CURSOR = "\033[?25l"
+C_SHOW_CURSOR = "\033[?25h"
+
+def draw_gauge(label: str, val: float, min_v: float, max_v: float, unit: str, width: int = 28, color=C_CYAN) -> str:
+    clamped = max(min_v, min(max_v, val))
+    ratio = (clamped - min_v) / (max_v - min_v) if max_v > min_v else 0.0
+    filled = int(round(ratio * width))
+    empty = width - filled
+    bar = f"{color}{'█' * filled}{C_DIM}{'░' * empty}{C_RESET}"
+    return f"{label:<12} [{bar}] {C_BOLD}{val:6.2f}{unit}{C_RESET} {C_DIM}({min_v:4.1f}-{max_v:4.1f}{unit}){C_RESET}"
+
+class HistoryBuffer:
+    def __init__(self, size=48):
+        self.size = size
+        self.v_history = [0.0] * size
+        self.i_history = [0.0] * size
+
+    def push(self, v: float, i: float):
+        self.v_history.pop(0)
+        self.v_history.append(v)
+        self.i_history.pop(0)
+        self.i_history.append(i)
+
+    def render_sparkline(self, data, min_val=0.0, max_val=5.5, height=5) -> list:
+        # 5-line vertical ASCII waveform plot
+        symbols = [" ", " ", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
+        lines = []
+        val_range = max_val - min_val if max_val > min_val else 1.0
+
+        for row in range(height - 1, -1, -1):
+            row_min = min_val + (row / height) * val_range
+            row_max = min_val + ((row + 1) / height) * val_range
+            row_mid = (row_min + row_max) / 2.0
+            line_chars = []
+            for v in data:
+                if v >= row_max:
+                    line_chars.append("█")
+                elif v < row_min:
+                    line_chars.append(" ")
+                else:
+                    # Map fractional height within row
+                    frac = (v - row_min) / (row_max - row_min)
+                    idx = int(frac * (len(symbols) - 1))
+                    line_chars.append(symbols[idx])
+            label = f"{row_max:4.1f}V ┤"
+            lines.append(f"{C_DIM}{label}{C_RESET}{C_CYAN}{''.join(line_chars)}{C_RESET}")
+        return lines
+
+def fetch_telemetry_http(url: str):
+    req = Request(url, headers={"User-Agent": "ehb-monitor/1.0"})
+    with urlopen(req, timeout=1.0) as resp:
+        body = resp.read().decode("utf-8")
+        return json.loads(body)
+
+def main():
+    parser = argparse.ArgumentParser(description="Terminal Oscilloscope & Electrical Telemetry Monitor")
+    parser.add_argument("--url", default="http://localhost:9105/api/telemetry", help="ehb-daemon HTTP telemetry URL")
+    parser.add_argument("-r", "--rate", type=float, default=10.0, help="Refresh rate in Hz (default: 10.0)")
+    parser.add_argument("--once", action="store_true", help="Print single snapshot frame to terminal and exit")
+    args = parser.parse_args()
+
+    history = HistoryBuffer(size=52)
+    interval = 1.0 / max(1.0, min(60.0, args.rate))
+
+    sys.stdout.write(C_HIDE_CURSOR)
+    sys.stdout.flush()
+
+    try:
+        while True:
+            try:
+                data = fetch_telemetry_http(args.url)
+                connected = True
+                err_msg = ""
+            except Exception as e:
+                connected = False
+                err_msg = str(e)
+                data = {
+                    "voltage_v": 0.0, "current_a": 0.0, "power_w": 0.0,
+                    "resistance_ohms": 0.0, "raw_adc": 0, "temperature_c": 0.0,
+                    "gpio_byte": 0, "fault_byte": 0, "seq_id": 0,
+                    "packets_total": 0, "crc_errors": 0, "last_update": 0
+                }
+
+            v = data.get("voltage_v", 0.0)
+            i = data.get("current_a", 0.0)
+            p = data.get("power_w", 0.0)
+            r = data.get("resistance_ohms", 0.0)
+            raw_adc = data.get("raw_adc", 0)
+            temp = data.get("temperature_c", 0.0)
+            gpio = data.get("gpio_byte", 0)
+            faults = data.get("fault_byte", 0)
+            seq = data.get("seq_id", 0)
+            pkts = data.get("packets_total", 0)
+            crc_err = data.get("crc_errors", 0)
+            crc_pct = (crc_err / pkts * 100.0) if pkts > 0 else 0.0
+
+            if connected:
+                history.push(v, i)
+
+            # Build UI
+            out = []
+            out.append(C_CLEAR)
+            out.append(f"{C_BOLD}{C_WHITE}╔════════════════════════════════════════════════════════════════════════════════════╗{C_RESET}")
+            out.append(f"{C_BOLD}{C_WHITE}║   EMBEDDED HARDWARE BRIDGE // OSCILLOSCOPE & DC/AC TELEMETRY MONITOR               ║{C_RESET}")
+            out.append(f"{C_BOLD}{C_WHITE}║   Target: {C_CYAN}{args.url:<34}{C_WHITE} | Mode: {C_GREEN}HIL PTY BRIDGE{C_WHITE}      ║{C_RESET}")
+            out.append(f"{C_BOLD}{C_WHITE}╚════════════════════════════════════════════════════════════════════════════════════╝{C_RESET}")
+
+            if not connected:
+                out.append(f"\n{C_RED}{C_BOLD}  [DISCONNECTED] Connecting to daemon ({args.url})...{C_RESET}")
+                out.append(f"  {C_DIM}Check: 'bin/ehb-daemon' or systemd service active.{C_RESET}\n")
+                out.append(f"  Error: {err_msg}")
+            else:
+                out.append(f" {C_BOLD}METRIC MEASUREMENTS (DC BUS){C_RESET}")
+                out.append(" " + draw_gauge("VOLTAGE", v, 0.0, 5.5, "V", width=28, color=C_CYAN))
+                out.append(" " + draw_gauge("CURRENT", i, 0.0, 1.0, "A", width=28, color=C_YELLOW))
+                out.append(" " + draw_gauge("POWER (P)", p, 0.0, 5.0, "W", width=28, color=C_GREEN))
+                out.append(" " + draw_gauge("TEMP (T)", temp, 10.0, 90.0, "°C", width=28, color=C_RED if temp > 60 else C_BLUE))
+
+                out.append(f"\n {C_BOLD}LIVE VOLTAGE OSCILLOSCOPE TRACE (Time domain){C_RESET}")
+                spark_lines = history.render_sparkline(history.v_history, min_val=0.0, max_val=5.5, height=5)
+                for sl in spark_lines:
+                    out.append(f"  {sl}")
+                out.append(f"  {C_DIM}0.0V ┴{'─' * 52}▶ t (recent 52 frames){C_RESET}")
+
+                out.append(f"\n {C_BOLD}8-CHANNEL DIGITAL LOGIC ANALYZER (GPIO PORT){C_RESET}")
+                pin_boxes = []
+                for pin in range(8):
+                    is_high = bool(gpio & (1 << pin))
+                    status_badge = f"{C_GREEN}● HIGH{C_RESET}" if is_high else f"{C_DIM}○ LOW {C_RESET}"
+                    pin_boxes.append(f"D{pin}:[{status_badge}]")
+                out.append(f"  {' '.join(pin_boxes[:4])}")
+                out.append(f"  {' '.join(pin_boxes[4:])}   {C_DIM}Register: 0b{gpio:08b} (0x{gpio:02X}){C_RESET}")
+
+                out.append(f"\n {C_BOLD}ELECTRICAL PARAMETERS & FAULT DETECTION{C_RESET}")
+                ov_status = f"{C_RED}{C_BOLD}[TRIPPED ⚡]{C_RESET}" if (faults & 0x01) else f"{C_GREEN}[NORMAL]{C_RESET}"
+                bo_status = f"{C_RED}{C_BOLD}[BROWNOUT ⚠]{C_RESET}" if (faults & 0x02) else f"{C_GREEN}[NORMAL]{C_RESET}"
+                ot_status = f"{C_RED}{C_BOLD}[OVERTEMP 🔥]{C_RESET}" if (faults & 0x04) else f"{C_GREEN}[NORMAL]{C_RESET}"
+
+                out.append(f"  Load Resistance: {C_BOLD}{r:7.2f} Ω{C_RESET} (Ohm's Law: R = V / I)")
+                out.append(f"  ADC Quantization: {C_BOLD}{raw_adc:4d} / 4095{C_RESET} (12-bit ADC @ 1.22 mV/LSB)")
+                out.append(f"  Fault Trip Array: OverVoltage: {ov_status} | Brownout: {bo_status} | OverTemp: {ot_status}")
+                out.append(f"  Stream Integrity: Packets RX: {C_BOLD}{pkts:<6d}{C_RESET} | Seq: #{seq:06d} | CRC Drops: {crc_err} ({crc_pct:.2f}%)")
+
+            out.append(f"\n{C_DIM}Press [Ctrl+C] to exit terminal monitor.{C_RESET}\n")
+
+            sys.stdout.write("\n".join(out))
+            sys.stdout.flush()
+            if args.once:
+                break
+            time.sleep(interval)
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sys.stdout.write(C_SHOW_CURSOR + "\n")
+        sys.stdout.flush()
+
+if __name__ == "__main__":
+    main()
